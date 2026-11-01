@@ -32,7 +32,7 @@ def to_documents(rows, keywords):
         metadata = {key: copy.deepcopy(value) for key, value in row.items() if key != "body"}
         defaults = ["uv", "릴리스", "release"] if row["category"] == "release" else []
         metadata["keywords"] = list(keywords.get(row["doc_id"], defaults))
-        document = todo("문서 변환: row의 body와 metadata로 Document를 만드세요.")
+        document = Document(page_content=row["body"], metadata=metadata)
         documents.append(document)
     return documents
 
@@ -45,10 +45,10 @@ def search_documents(query, documents, allowed_ids, top_k=3):
     allowed = set(allowed_ids)
     scored = []
     for index, document in enumerate(documents):
-        if todo("키워드 검색: 이 문서의 doc_id가 allowed 밖에 있나요?"):
+        if document.metadata["doc_id"] not in allowed:
             continue
         words = {word.casefold() for word in document.metadata.get("keywords", []) if word.strip()}
-        score = todo("키워드 검색: words 중 normalized에 포함된 키워드의 개수를 구하세요.")
+        score = sum(1 for word in words if word in normalized)
         if score > 0:
             scored.append((score, index, document))
     scored.sort(key=lambda item: (-item[0], item[1]))
@@ -68,8 +68,9 @@ def format_context(documents):
 def build_context_chain(documents):
     """검색 입력 연결: 입력 보존과 검색을 병렬로 연결합니다."""
     # 작성 이유: 입력 보존과 검색을 나누는 이유를 한두 줄로 적으세요.
+    # - 사용자의 원 질문을 유지하면서 필요한 정보만 추가적으로 찾아서 정확도를 높이기 위해서입니다. 
     def retrieve(value):
-        query = todo("검색 입력 연결: support.search_query에 question과 history를 전달하세요.")
+        query = support.search_query(value["question"], value.get("history", []))
         return search_documents(query, documents, value["document_ids"])
 
     def merge(value):
@@ -78,17 +79,17 @@ def build_context_chain(documents):
 
     preserve = RunnablePassthrough().with_config(run_name="preserve_input")
     retrieve_chain = RunnableLambda(retrieve).with_config(run_name="retrieve")
-    parallel = todo("검색 입력 연결: original=preserve, documents=retrieve_chain을 RunnableParallel로 묶으세요.")
+    parallel = RunnableParallel(original=preserve, documents=retrieve_chain)
     return parallel.with_config(run_name="parallel_prepare") | RunnableLambda(merge).with_config(run_name="merge_context")
 
 
 # 필수 2: 기본 체인
 def build_prompt_and_parser():
     """프롬프트와 파서: 답변 형식과 이전 대화 자리를 연결합니다."""
-    parser = todo("프롬프트와 파서: support.Answer용 PydanticOutputParser를 만드세요.")
+    parser = PydanticOutputParser(pydantic_object=support.Answer)
     prompt = ChatPromptTemplate.from_messages([
         ("system", "{policy}\n\n출력 형식:\n{format_instructions}\n\n이번 검색 문서:\n{context}"),
-        todo("프롬프트와 파서: history용 MessagesPlaceholder를 넣으세요."),
+        MessagesPlaceholder(variable_name="history"),
         ("human", "{question}"),
     ]).partial(policy=POLICY_INSTRUCTIONS, format_instructions=parser.get_format_instructions())
     return prompt.with_config(run_name="prompt"), parser.with_config(run_name="parser")
@@ -98,11 +99,11 @@ def validate_sources(answer, documents):
     """출처 검사: 이번에 검색한 문서만 출처로 허용합니다."""
     answer = support.Answer.model_validate(answer)
     allowed = {document.metadata["doc_id"] for document in documents}
-    if todo("출처 검사: source_ids에 중복이 있나요?"):
+    if len(answer.source_ids) != len(set(answer.source_ids)):
         raise support.SourceValidationError("출처가 중복됩니다.")
-    if todo("출처 검사: source_ids에 allowed 밖의 ID가 있나요?"):
+    if any(source_id not in allowed for source_id in answer.source_ids):
         raise support.SourceValidationError("이번 검색 결과에 없는 출처입니다.")
-    if todo("출처 검사: 출처가 없는데 needs_human이 false인가요?"):
+    if not answer.source_ids and not answer.needs_human:
         raise support.SourceValidationError("근거 없는 답변에는 담당자 확인이 필요합니다.")
     return answer
 
@@ -110,10 +111,10 @@ def validate_sources(answer, documents):
 def build_primary_chain(model):
     """기본 체인 연결: prompt, model, parser와 출처 검사를 연결합니다."""
     prompt, parser = build_prompt_and_parser()
-    generate = todo("기본 체인 연결: prompt, model, parser를 순서대로 |로 연결하세요.")
+    generate = prompt | model | parser
 
     def finish(value):
-        answer = todo("기본 체인 연결: parsed와 documents를 validate_sources로 검사하세요.")
+        answer = validate_sources(value["parsed"], value["documents"])
         return {"reply": answer, "route": "primary"}
 
     return (RunnablePassthrough.assign(parsed=generate.with_config(run_name="generate_parse"))
@@ -128,7 +129,7 @@ def build_answer_chain(model, reliable=False):
     no_documents = RunnableLambda(lambda value: {"reply": support.safe_answer("no_documents"),
                                                 "route": "no_documents"})
     def has_no_documents(value):
-        return todo("문서 없음 분기: value의 documents가 비어 있는지 확인하세요.")
+        return not value["documents"]
     return RunnableBranch((has_no_documents, no_documents), primary).with_config(run_name="route_by_documents")
 
 
@@ -138,33 +139,35 @@ def get_history(store, session_id):
     if not isinstance(session_id, str) or not session_id.strip():
         raise ValueError("session_id는 비어 있지 않은 문자열입니다.")
     if session_id not in store:
-        store[session_id] = todo("세션 이력: 새 InMemoryChatMessageHistory를 만드세요.")
+        store[session_id] = InMemoryChatMessageHistory()
     return store[session_id]
 
 
 def commit_history(store, session_id, question, outcome):
     """이력 저장: 완료된 primary의 질문과 답변만 저장합니다."""
     # 작성 이유: 검색 문서와 대화 이력을 구분하고 primary만 저장하는 이유를 적으세요.
-    if todo("이력 저장: outcome의 route가 primary가 아닌가요?"):
+    # - 검색 문서는 매번 달라지는 참고 자료이고 대화 이력은 사용자의 의도와 맥락이 중요하기에 따로 관리하기 때문에 primary를 따로 보관해 중복과 오염을 막고 또한 메모리를 효율적으로 사용할 수 있습니다. 
+    if outcome["route"] != "primary":
         return
     answer = support.Answer.model_validate(outcome["reply"])
-    messages = todo("이력 저장: question의 HumanMessage, answer.answer의 AIMessage 순서로 목록을 만드세요.")
+    messages = [HumanMessage(content=question), AIMessage(content=answer.answer)]
     get_history(store, session_id).add_messages(messages)
 
 
 # 필수 4: 실패 복구
 def build_resilient_chain(primary):
     """실패 복구: 허용 오류에만 처음을 포함해 최대 두 번 시도합니다."""
-    retry = todo("실패 복구: primary.with_retry에 retry_if_exception_type=support.RECOVERABLE, stop_after_attempt=2, wait_exponential_jitter=False를 적용하세요.")
+    retry = primary.with_retry(retry_if_exception_type=support.RECOVERABLE, stop_after_attempt=2, wait_exponential_jitter=False)
     fallback = RunnableLambda(lambda value: {"reply": support.safe_answer("fallback"),
                                             "route": "fallback"}).with_config(run_name="fallback")
-    return todo("실패 복구: retry.with_fallbacks에 [fallback]과 exceptions_to_handle=support.RECOVERABLE을 연결하세요.")
+    return retry.with_fallbacks([fallback], exceptions_to_handle=support.RECOVERABLE)
 
 
 # 필수 5: 스트리밍
 def stream_answer(prepared, model, config=None):
     """청크 전달: 아래 순서대로 청크 전달, 검증과 실패 분기를 채웁니다."""
     # 관측 메모: 실행 기록에서 확인한 실패 단계와 처리 결과를 한두 줄로 적으세요.
+    # - 답변을 생성해 보내는 단계에서 오류가 발생하였고 답변은 "현재 답변 생성 기능이 제한되어 정확한 안내를 확정하지 못했습니다. 잠시 후 다시 시도하거나 담당자에게 확인해 주세요." 나왔습니다. 
     if not prepared["documents"]:
         yield {"type": "final", "reply": support.safe_answer("no_documents").model_dump(), "route": "no_documents"}
         return
@@ -172,7 +175,7 @@ def stream_answer(prepared, model, config=None):
     stream_chain = prompt | model
     sent_delta = False
     for attempt in range(2):
-        iterator = todo("청크 전달: stream_chain.stream에 prepared와 config를 전달하세요.")
+        iterator = stream_chain.stream(prepared, config=config)
         parts = []
         try:
             for chunk in iterator:
@@ -180,17 +183,17 @@ def stream_answer(prepared, model, config=None):
                 if text:
                     parts.append(text)
                     sent_delta = True
-                    yield todo("청크 전달: text를 담은 delta 이벤트 dict를 만드세요.")
+                    yield {"type": "delta", "text": text}
             parsed = parser.invoke("".join(parts), config=config)
-            answer = todo("청크 전달: parsed와 이번 documents로 출처를 검사하세요.")
-            yield todo("청크 전달: answer.model_dump()를 담은 final primary 이벤트를 만드세요.")
+            answer = validate_sources(parsed, prepared["documents"])
+            yield {"type": "final", "reply": answer.model_dump(), "route": "primary"}
             return
         except support.RECOVERABLE:
-            if todo("실패 처리: 아직 delta를 보내지 않았고 첫 시도인가요?"):
+            if not sent_delta and attempt == 0:
                 continue
             if sent_delta:
-                yield todo("실패 처리: reason이 unverified_output인 reset 이벤트를 만드세요.")
-            yield todo("실패 처리: support.safe_answer('fallback')을 담은 final fallback 이벤트를 만드세요.")
+               yield {"type": "reset", "reason": "unverified_output"}
+            yield {"type": "final", "reply": support.safe_answer("fallback").model_dump(), "route": "fallback"}
             return
         except Exception:
             if sent_delta:
@@ -216,7 +219,7 @@ class TraceHandler(BaseCallbackHandler):
     def _start(self, kind, run_id, parent_run_id, name):
         with self.sink.lock:
             key = str(run_id)
-            state = {"started": todo("실행 기록: self.clock()으로 시작 시각을 읽으세요."),
+            state = {"started": self.clock(),
                      "stage": support.safe_stage(name),
                      "parent_run_id": str(parent_run_id) if parent_run_id else None, "chunk_count": 0}
             self.active[key] = state
@@ -232,8 +235,8 @@ class TraceHandler(BaseCallbackHandler):
             state = self.active.pop(key, None)
             if state is None:
                 return
-            elapsed_ms = todo("실행 기록: self.clock()과 state['started']의 차이를 밀리초로 계산하세요.")
-            error_type = todo("실행 기록: 오류가 있으면 예외 클래스 이름, 없으면 None을 선택하세요.")
+            elapsed_ms = (self.clock() - state["started"]) * 1000
+            error_type = type(error).__name__ if error is not None else None
             self.sink.write({"event": f"{kind}_{'error' if error is not None else 'end'}",
                              "stage": state["stage"], "run_id": key,
                              "parent_run_id": state["parent_run_id"], "mode": self.mode,
@@ -248,7 +251,7 @@ class TraceHandler(BaseCallbackHandler):
             state = self.active.get(str(run_id))
             if state is None:
                 return
-            state["chunk_count"] = todo("실행 기록: 현재 청크 개수에 이번 텍스트 청크 한 개를 더하세요.")
+            state["chunk_count"] = state["chunk_count"] + 1
             self.sink.write({"event": "model_chunk", "stage": state["stage"], "run_id": str(run_id),
                              "parent_run_id": state["parent_run_id"], "mode": self.mode,
                              "elapsed_ms": max(0.0, (self.clock() - state["started"]) * 1000),
@@ -276,8 +279,18 @@ class TraceHandler(BaseCallbackHandler):
 
 # 선택 심화 1: 초안 검토
 def review_draft(draft, documents, reviewer, rewriter):
+    current = validate_sources(draft, documents)
+    decision = reviewer({"draft": current, "documents": documents})
+    if decision == "keep":
+        return {"reply": current, "route": "primary"}
+    if decision == "revise":
+        revised = rewriter({"draft": current, "documents": documents})
+        current = validate_sources(revised, documents)
+        decision = reviewer({"draft": current, "documents": documents})
+        if decision == "keep":
+            return {"reply": current, "route": "primary"}
+    return {"reply": support.safe_answer("fallback"), "route": "fallback"}
     """선택 심화: 필수에서 만든 검증을 재사용해 검토, 한 번 수정, 재검토 흐름을 설계합니다."""
-    raise NotImplementedError("선택 심화: review_draft를 구현하세요.")
 
 
 if __name__ == "__main__":

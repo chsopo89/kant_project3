@@ -1,0 +1,17 @@
+/*
+!/.gitignore
+!/kant-next-prompt-student/
+!/kant-next-api-student/
+!/kant-next-langchain-student/
+
+/kant-next-prompt-student/*
+!/kant-next-prompt-student/main.py
+!/kant-next-prompt-student/AI_USAGE.md
+
+/kant-next-api-student/*
+!/kant-next-api-student/app.py
+!/kant-next-api-student/AI_USAGE.md
+
+/kant-next-langchain-student/*
+!/kant-next-langchain-student/main.py
+!/kant-next-langchain-student/AI_USAGE.md

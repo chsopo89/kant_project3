@@ -28,6 +28,7 @@ POLICY_SOURCE = "B1"
 # 자료 수집. 원천 수집: 성공한 페이지만 보존하고 실패하면 중단합니다.
 def collect_releases(client, output_dir, *, mode, collected_at, max_pages=2, per_page=5):
     # 작성 메모: 파일이나 웹 페이지 대신 이 API를 쓰는 이유를 1~2줄로 적으세요.
+    # - API는 필요한 데이터를 정해진 형식으로 바로 제공하기 때문에 웹페이지나 파일보다 정확하고 빠르게 처리하기 때문입니다. 
     # 수집: 페이지와 크기: 현재 page와 per_page를 담은 dict. 예: {"키": 변수}.
     # 수집: HTTP 상태 검사: 응답의 HTTP 오류를 확인하는 메서드를 호출하세요.
     # 수집: 다음 페이지 확인: response.links 안에 다음 페이지를 뜻하는 "next"가 있는지 판단하세요.
@@ -55,7 +56,7 @@ def collect_releases(client, output_dir, *, mode, collected_at, max_pages=2, per
         # 새 실행은 예전 성공 파일을 재사용하지 않습니다. 한글도 그대로 저장합니다.
         for name, value in (("raw_pages.json", pages), ("collection_report.json", report)):
             with (output_dir / name).open("w", encoding="utf-8") as stream:
-                json.dump(support.todo("수집: 저장할 데이터"), stream, ensure_ascii=False, indent=2)
+                json.dump(value, stream, ensure_ascii=False, indent=2)
                 stream.write("\n")
 
     save_current_run()
@@ -63,11 +64,11 @@ def collect_releases(client, output_dir, *, mode, collected_at, max_pages=2, per
         try:
             response = client.get(
                 support.GITHUB_URL,
-                params=support.todo("수집: 페이지와 크기"),
+                params={"page": page, "per_page": per_page},
                 headers=support.GITHUB_HEADERS,
                 timeout=httpx.Timeout(15.0, connect=5.0),
             )
-            support.todo("수집: HTTP 상태 검사")  # response.raise_for_status
+            response.raise_for_status()  # response.raise_for_status
             items = response.json()
             if not isinstance(items, list):
                 raise ValueError("JSON 응답이 배열이 아닙니다.")
@@ -92,7 +93,7 @@ def collect_releases(client, output_dir, *, mode, collected_at, max_pages=2, per
         pages.append({"page": page, "items": items})
         report["successful_pages"] += 1
         report["raw_count"] += len(items)
-        has_next = support.todo("수집: 다음 페이지 확인")
+        has_next = "next" in response.links
         if not has_next:
             report["success"] = True
             break
@@ -118,6 +119,7 @@ def validate_timestamp(value, *, utc=False):
 
 def normalize_releases(raw_pages, collected_at):
     # 작성 메모: 본문 외에 출처와 두 시각을 구분해 남기는 이유를 1~2줄로 적으세요.
+    # - 답변 내용과 그 근거를 구분해 놓아서 검증 및 서로 다른 의견도 추적할 수 있기 때문입니다. 
     # 정제: 플래그 자료형: draft나 prerelease 중 boolean이 아닌 값이 있는지 판단합니다.
     # 정제: 제목 대체: 유효한 name을 쓰고, 비었으면 tag_name을 고릅니다.
     # 정제: 빈 본문: 정리한 body가 빈 문자열인지 판단합니다.
@@ -140,7 +142,7 @@ def normalize_releases(raw_pages, collected_at):
                 reason = "invalid_object"
             elif type(raw_id) is not int or raw_id <= 0 or len(f"release-uv-{raw_id}") > support.LIMITS["doc_id"]:
                 reason = "invalid_id"
-            elif support.todo("정제: 플래그 자료형"):
+            elif type(item.get("draft")) is not bool or type(item.get("prerelease")) is not bool:
                 reason = "invalid_flags"
             elif item["draft"] or item["prerelease"]:
                 status = "excluded"
@@ -150,7 +152,7 @@ def normalize_releases(raw_pages, collected_at):
                 if name is not None and not isinstance(name, str):
                     reason = "invalid_name"
                 else:
-                    source_title = support.todo("정제: 제목 대체")
+                    source_title = name if isinstance(name, str) and name.strip() else item.get("tag_name")
                     if not isinstance(source_title, str) or not source_title.strip():
                         reason = "missing_title"
                     else:
@@ -164,7 +166,7 @@ def normalize_releases(raw_pages, collected_at):
                         reason = "invalid_body"
                     else:
                         body = clean_text(item["body"])
-                        if support.todo("정제: 빈 본문"):
+                        if not body:
                             reason = "empty_body"
                         elif len(body) > support.LIMITS["body"]:
                             reason = "body_too_long"
@@ -178,7 +180,7 @@ def normalize_releases(raw_pages, collected_at):
                         validate_timestamp(published_at)
                     except ValueError:
                         reason = "invalid_published_at"
-                if reason is None and support.todo("정제: 중복 ID"):
+                if reason is None and raw_id in accepted_ids:
                     reason = "duplicate_id"
                 if reason is None:
                     status = "kept"
@@ -186,9 +188,9 @@ def normalize_releases(raw_pages, collected_at):
                     documents.append({
                         "doc_id": f"release-uv-{raw_id}",
                         "title": title,
-                        "body": support.todo("정제: 본문"),
-                        "source_url": support.todo("정제: 출처 URL"),
-                        "collected_at": support.todo("정제: 수집시각"),
+                        "body": body,
+                        "source_url": source_url,
+                        "collected_at": collected_at,
                         "category": "release",
                     })
 
@@ -219,13 +221,16 @@ DocumentId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=
 class Document(CourseModel):
     doc_id: DocumentId
     title: str = Field(min_length=1, max_length=support.LIMITS["title"])
+    body: str = Field(min_length=1, max_length=support.LIMITS["body"])
+    source_url: str = Field(min_length=1, max_length=support.LIMITS["source_url"])
+    collected_at: str
+    category: Literal["installation", "access", "incident", "general", "release"]
     # TODO 문서 API: 문서 모델 필드: title 예시를 따라 body와 source_url의 자료형과 길이를 선언하세요.
     # collected_at은 str, category는 과제 본문의 다섯 값만 허용합니다.
     # 허용 문자열은 Literal["값1", "값2"]처럼 나열할 수 있습니다.
 
     @model_validator(mode="after")
     def validate_rules(self):
-        support.todo("문서 API: 문서 모델 필드")
         validate_url(self.source_url)
         validate_timestamp(self.collected_at, utc=True)
         return self
@@ -233,12 +238,13 @@ class Document(CourseModel):
 
 class QueryRequest(CourseModel):
     question: str = Field(min_length=3, max_length=1000)
+    document_ids: list[DocumentId] = Field(min_length=1, max_length=3)
+    session_id: str = Field(default="demo", min_length=1, max_length=64)
     # TODO 문서 API: 질문 모델 필드: document_ids는 list[DocumentId], 길이는 1~3입니다.
     # session_id는 기본값 "demo"인 str이며 길이는 1~64입니다.
 
     @model_validator(mode="after")
     def validate_rules(self):
-        support.todo("문서 API: 질문 모델 필드")
         if len(self.document_ids) != len(set(self.document_ids)):
             raise ValueError("document_ids는 중복될 수 없습니다.")
         return self
@@ -246,12 +252,14 @@ class QueryRequest(CourseModel):
 
 class QueryReply(CourseModel):
     answer: str = Field(min_length=1)
+    source_ids: list[DocumentId]
+    needs_human: bool
+    category: Literal["installation", "access", "incident", "general"]
     # TODO 문서 API: 답변 모델 필드: source_ids는 list[DocumentId], needs_human은 bool입니다.
     # category는 답변용 네 값만 허용합니다. Document의 release와 구분하세요.
 
     @model_validator(mode="after")
     def validate_rules(self):
-        support.todo("문서 API: 답변 모델 필드")
         if len(self.source_ids) != len(set(self.source_ids)):
             raise ValueError("source_ids는 중복될 수 없습니다.")
         if not self.source_ids and not self.needs_human:
@@ -261,23 +269,23 @@ class QueryReply(CourseModel):
 
 def response_models():
     # 응답 모델: 단건 문서는 Document, 질문 답변은 QueryReply 구조를 사용합니다.
-    return {"documents": list[Document], "document": support.todo("문서 API: 단건 응답 모델"), "query": support.todo("문서 API: 질문 응답 모델")}
+    return {"documents": list[Document], "document": Document, "query": QueryReply}
 
 
 def find_document(store, doc_id):
-    # 작성 메모: GET/POST의 입력 위치와 없는 ID/잘못된 입력의 차이를 1~2줄로 적으세요.
-    # 문서 API: 없는 문서: store에 doc_id가 없는 경우만 404로 끝냅니다.
-    if support.todo("문서 API: 없는 문서"):
-        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다.")
+    if doc_id not in store:
+        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다.",)
     return store[doc_id]
-
+    # 작성 메모: GET/POST의 입력 위치와 없는 ID/잘못된 입력의 차이를 1~2줄로 적으세요.
+    # - GET은 주로 URL 경로나 쿼리 문자열의 입력을 전달하고 POST는 요청 본문의 데이터를 담아 전달합니다. 없는 ID 경우 존재하지 않는 자원이고 잘못된 입력인 경우 형식이나 올바르지 않은 요청입니다.  
+    # 문서 API: 없는 문서: store에 doc_id가 없는 경우만 404로 끝냅니다.
 
 def register_document(store, document):
     # 문서 API: 중복 ID: document.doc_id가 store에 이미 있는지 확인하세요.
     # 문서 API: 중복 URL: store.values()의 문서 중 source_url이 같은 문서가 있는지 확인하세요.
     # any(조건 for 항목 in 목록)는 조건을 만족하는 항목이 하나라도 있으면 True입니다.
-    duplicate_id = support.todo("문서 API: 중복 ID")
-    duplicate_url = support.todo("문서 API: 중복 URL")
+    duplicate_id = document.doc_id in store
+    duplicate_url = any(saved.source_url == document.source_url for saved in store.values())
     if duplicate_id or duplicate_url:
         raise HTTPException(status_code=409, detail="문서 ID 또는 출처 URL이 이미 등록되어 있습니다.")
     store[document.doc_id] = document
@@ -286,11 +294,11 @@ def register_document(store, document):
 
 # 앱 생성과 라우트 선언은 제공됩니다. 위 함수를 실제 API에 연결합니다.
 
-# 모델 연결. 현재 선택된 문서만 연결하고 실제 HTTP 요청을 비동기로 기다립니다.
+    # 모델 연결. 현재 선택된 문서만 연결하고 실제 HTTP 요청을 비동기로 기다립니다.
 def build_prompt(question, documents):
     # 모델 연결: 질문과 문서: question과 selected를 각각 question, documents 키에 담으세요.
     selected = [document.model_dump() if isinstance(document, BaseModel) else dict(document) for document in documents]
-    input_text = json.dumps(support.todo("모델 연결: 질문과 문서"), ensure_ascii=False)
+    input_text = json.dumps({"question": question, "documents": selected}, ensure_ascii=False)
     return POLICY_INSTRUCTIONS, input_text
 
 
@@ -302,24 +310,20 @@ async def call_model_once(client, question, documents, config):
         raise HTTPException(status_code=503, detail="실제 모델 연결 설정이 필요합니다.")
     instructions, input_text = build_prompt(question, documents)
     payload = support.provider_payload(instructions, input_text, config["model"])
-    response = await client.post(
-        config["endpoint"],
-        headers={"Authorization": f"Bearer {config.get('api_key', '')}"},
-        json=payload,
-        timeout=httpx.Timeout(config["http_timeout"], connect=config["connect_timeout"]),
-    )
+    response = await client.post(config["endpoint"], headers={"Authorization": f"Bearer {config.get('api_key', '')}"}, json=payload, timeout=httpx.Timeout(config["http_timeout"], connect=config["connect_timeout"]))
     response.raise_for_status()
     text = support.extract_output(response.json())
-    reply = QueryReply.model_validate(support.todo("모델 연결: 응답 JSON"))
+    reply = QueryReply.model_validate(json.loads(text))
     selected_ids = {document.doc_id if isinstance(document, BaseModel) else document["doc_id"] for document in documents}
-    if support.todo("모델 연결: 출처 검사"):
+    if any(source_id not in selected_ids for source_id in reply.source_ids):
         raise ValueError("선택하지 않은 문서를 출처로 반환했습니다.")
     return reply
 
 
-# 실패 처리. 시도 전체의 종료 시한도 HTTP 단계별 timeout과 같은 규칙으로 처리합니다.
+    # 실패 처리. 시도 전체의 종료 시한도 HTTP 단계별 timeout과 같은 규칙으로 처리합니다.
 async def query_with_retry(client, question, documents, config, *, sleep=asyncio.sleep):
     # 작성 메모: await로 기다리는 이유와 두 번까지만 시도하는 이유를 1~2줄로 적으세요.
+    # - awit는 비동기 작업의 결과가 올 때까지 기다려서 완료하지 않은 값을 사용하는 오류를 막기 위해 사용하는 것이며 두번까지 시도하는 이유는 일시적인 오류는 복구하지만 무한 재시도를 하는 시도는 막기 위해서입니다. 
     # attempt는 첫 시도에서 0, 두 번째 시도에서 1입니다.
     # 실패 처리: timeout 재시도: timeout이 첫 시도에서 발생했을 때만 다시 요청합니다.
     # 실패 처리: HTTP 재시도: 첫 시도의 500~599 응답만 다시 요청합니다.
@@ -330,17 +334,17 @@ async def query_with_retry(client, question, documents, config, *, sleep=asyncio
                 call_model_once(client, question, documents, config), config["attempt_timeout"],
             )
         except (TimeoutError, httpx.TimeoutException):
-            if support.todo("실패 처리: timeout 재시도"):
+            if attempt == 0:
                 await sleep(config["retry_delay"])
                 continue
             raise HTTPException(status_code=504, detail="모델 응답 제한 시간을 초과했습니다.") from None
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if support.todo("실패 처리: HTTP 재시도"):
+            if attempt == 0 and 500 <= status < 600:
                 await sleep(config["retry_delay"])
                 continue
             if status == 429:
-                raise HTTPException(status_code=support.todo("실패 처리: 공급자 429"), detail="모델 공급자의 호출 한도에 도달했습니다.") from None
+                raise HTTPException(status_code=503, detail="모델 공급자의 호출 한도에 도달했습니다.") from None
             raise HTTPException(status_code=502, detail="모델 공급자가 정상 응답을 반환하지 않았습니다.") from None
         except httpx.RequestError:
             raise HTTPException(status_code=502, detail="모델 공급자에 연결하지 못했습니다.") from None
@@ -348,18 +352,18 @@ async def query_with_retry(client, question, documents, config, *, sleep=asyncio
             raise HTTPException(status_code=502, detail="모델 응답의 형식 또는 출처가 올바르지 않습니다.") from None
 
 
-# 요청 제한과 기록. await가 없는 작은 함수 안에서 구간 판단과 횟수 변경을 끝냅니다.
+    # 요청 제한과 기록. await가 없는 작은 함수 안에서 구간 판단과 횟수 변경을 끝냅니다.
 def admit_query(state, now, *, limit=30, window=60):
     # 처음에는 state={"start": None, "count": 0}입니다. start=0은 정상 시각입니다.
     # 요청 제한: 구간 갱신: 첫 요청이거나 현재 구간이 window초 이상 지났는지 판단합니다.
     # 요청 제한: 한도 확인: 현재 count가 limit에 도달했는지 판단합니다.
     # 요청 제한: 요청 수 증가: 허용한 사용자 요청 한 건을 셉니다. 모델 재시도는 여기로 돌아오지 않습니다.
-    if support.todo("요청 제한: 구간 갱신"):
+    if state["start"] is None or now - state["start"] >= window:
         state["start"] = now
         state["count"] = 0
-    if support.todo("요청 제한: 한도 확인"):
+    if state["count"] >= limit:
         return max(1, math.ceil(window - (now - state["start"])))
-    state["count"] += support.todo("요청 제한: 요청 수 증가")
+    state["count"] += 1
     return 0
 
 
@@ -371,7 +375,7 @@ async def request_logging(request, call_next, *, mode, logger):
     started_at = time.monotonic()
     response = await call_next(request)
     elapsed_ms = round((time.monotonic() - started_at) * 1000, 3)
-    fields = support.todo("기록: 로그 필드")
+    fields = {"method": request.method, "path": support.safe_route(request), "status": response.status_code, "mode": mode, "elapsed_ms": elapsed_ms}
     logger.info(json.dumps(fields, ensure_ascii=False))
     response.headers["X-DevDesk-Mode"] = mode
     return response
@@ -385,13 +389,28 @@ def create_app(*, mode="fixture", stage="observe", documents=None, config=None, 
 
 # 선택 심화: 필수 실행 경로에서는 호출하지 않습니다.
 def compare_snapshots(before, after):
+    before_by_id = {document["doc_id"]: document for document in before}
+    after_by_id = {document["doc_id"]: document for document in after}
+    all_ids = sorted(set(before_by_id) | set(after_by_id))
+    fields = ["title", "body", "source_url", "category"]
+    results = []
+    for doc_id in all_ids:
+        changed_fields = []
+        if doc_id not in before_by_id:
+            status = "added"
+        elif doc_id not in after_by_id:
+            status = "missing"
+        else:
+            changed_fields = [field for field in fields if before_by_id[doc_id][field] != after_by_id[doc_id][field]]
+            status = "changed" if changed_fields else "unchanged"
+        results.append({"doc_id": doc_id, "status": status, "changed_fields": changed_fields})
+    return results    
     """ID별 added/changed/unchanged/missing과 changed_fields를 반환합니다.
 
     title, body, source_url, category만 비교하며 collected_at 변경은 제외합니다.
     입력을 수정하지 않고 doc_id 순서로 정렬합니다. 자세한 예시는 과제 본문에 있습니다.
     필수와 달리 함수의 순서와 자료구조부터 직접 구성하세요.
     """
-    raise NotImplementedError("선택 심화: 두 스냅샷 비교를 구현하세요.")
 
 
 if __name__ == "__main__":
